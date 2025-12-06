@@ -1,0 +1,31 @@
+{
+  "name": "asdf-validator-lite",
+  "version": "0.1.0",
+  "description": "Track creator fees for a single Pump.fun token with Proof-of-History",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "asdf-validator-lite": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "dev": "ts-node cli.ts"
+  },
+  "keywords": [
+    "pump.fun",
+    "solana",
+    "creator-fees",
+    "validator",
+    "proof-of-history"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@solana/web3.js": "^1.87.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.2"
+  }
+}
