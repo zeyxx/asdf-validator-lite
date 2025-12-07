@@ -28,6 +28,7 @@ interface CLIArgs {
   bondingCurve: string | null;
   rpcUrl: string;
   verbose: boolean;
+  watch: boolean;
   showHelp: boolean;
   pollInterval: number;
   historyFile: string | null;
@@ -52,6 +53,7 @@ function parseArgs(args: string[]): CLIArgs {
     bondingCurve: null,
     rpcUrl: getRpcUrl(),
     verbose: false,
+    watch: false,
     showHelp: false,
     pollInterval: 2000,
     historyFile: null,
@@ -65,6 +67,8 @@ function parseArgs(args: string[]): CLIArgs {
       result.showHelp = true;
     } else if (arg === '--verbose' || arg === '-v') {
       result.verbose = true;
+    } else if (arg === '--watch' || arg === '-w') {
+      result.watch = true;
     } else if (arg === '--mint' || arg === '-m') {
       result.mint = args[++i];
     } else if (arg === '--symbol' || arg === '-s') {
@@ -116,6 +120,7 @@ OPTIONS:
   --history, -H <FILE>       Enable Proof-of-History, save to FILE
   --verify, -V <FILE>        Verify a Proof-of-History file (standalone)
   --verbose, -v              Enable verbose logging
+  --watch, -w                Compact inline monitor mode
   --help, -h                 Show this help
 
 ENVIRONMENT:
@@ -262,6 +267,11 @@ async function main(): Promise<void> {
   }
   console.log('═'.repeat(55));
 
+  // Watch mode state
+  let lastFee = 0;
+  let lastFeeTime = 0;
+  let entryCount = 0;
+
   // Create daemon
   const daemon = new ValidatorLiteDaemon({
     rpcUrl: args.rpcUrl,
@@ -269,26 +279,37 @@ async function main(): Promise<void> {
     symbol: args.symbol,
     bondingCurve: args.bondingCurve || undefined,
     pollInterval: args.pollInterval,
-    verbose: args.verbose,
+    verbose: args.verbose && !args.watch,
     historyFile: args.historyFile || undefined,
 
     onFeeDetected: (amount, vaultType, balance) => {
       const sol = Number(amount) / 1e9;
-      const time = new Date().toISOString().slice(11, 19);
-      console.log(`[${time}] 💰 ${args.symbol} (${vaultType}): +${sol.toFixed(6)} SOL`);
+      lastFee = sol;
+      lastFeeTime = Date.now();
+      entryCount++;
+
+      if (args.watch) {
+        // Inline update handled by watchInterval
+      } else {
+        const time = new Date().toISOString().slice(11, 19);
+        console.log(`[${time}] 💰 ${args.symbol} (${vaultType}): +${sol.toFixed(6)} SOL`);
+      }
     },
 
-    onHistoryEntry: args.historyFile ? (entry) => {
+    onHistoryEntry: args.historyFile && !args.watch ? (entry) => {
       const icon = entry.eventType === 'CLAIM' ? '📤' : '🔗';
       console.log(`         ${icon} Hash: ${entry.hash.slice(0, 16)}... (${entry.eventType} #${entry.sequence})`);
     } : undefined,
 
     onMigration: (ammVault) => {
+      if (args.watch) {
+        process.stdout.write('\n');
+      }
       console.log(`\n🚀 TOKEN MIGRATED TO AMM!`);
       console.log(`   AMM Vault: ${ammVault}\n`);
     },
 
-    onStats: (total, bcFees, ammFees) => {
+    onStats: args.watch ? undefined : (total, bcFees, ammFees) => {
       console.log('\n📊 STATS');
       console.log('─'.repeat(40));
       console.log(`Total: ${(Number(total) / 1e9).toFixed(6)} SOL`);
@@ -302,13 +323,21 @@ async function main(): Promise<void> {
     },
   });
 
+  // Watch mode interval
+  let watchInterval: NodeJS.Timeout | null = null;
+
   // Handle shutdown
   let shuttingDown = false;
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
 
-    console.log('\n\n🛑 Shutting down...');
+    if (watchInterval) {
+      clearInterval(watchInterval);
+      process.stdout.write('\n');
+    }
+
+    console.log('\n🛑 Shutting down...');
     daemon.stop();
 
     const total = daemon.getTotalFees();
@@ -350,24 +379,43 @@ async function main(): Promise<void> {
   process.on('SIGTERM', shutdown);
 
   // Start daemon
-  console.log('\n▶ Starting daemon...\n');
+  if (!args.watch) {
+    console.log('\n▶ Starting daemon...\n');
+  }
   await daemon.start();
 
   const tokenInfo = daemon.getTokenInfo();
-  if (tokenInfo) {
-    console.log(`\n📋 TOKEN INFO`);
-    console.log('─'.repeat(40));
-    console.log(`Mint:        ${tokenInfo.mint.toBase58()}`);
-    console.log(`BC:          ${tokenInfo.bondingCurve.toBase58()}`);
-    console.log(`Creator:     ${tokenInfo.creator.toBase58()}`);
-    console.log(`BC Vault:    ${tokenInfo.creatorVaultBC.toBase58()}`);
-    console.log(`AMM Vault:   ${tokenInfo.creatorVaultAMM.toBase58()}`);
-    console.log(`Pool:        ${tokenInfo.pool.toBase58()}`);
-    console.log(`Migrated:    ${tokenInfo.migrated ? 'Yes (AMM)' : 'No (Bonding Curve)'}`);
-    console.log('─'.repeat(40));
-  }
 
-  console.log('\n✅ Daemon running. Press Ctrl+C to stop.\n');
+  if (args.watch) {
+    // Watch mode: single line updates
+    console.log(`\n▶ ${args.symbol} | Watching... (Ctrl+C to stop)\n`);
+
+    watchInterval = setInterval(() => {
+      const total = daemon.getTotalFees();
+      const ago = lastFeeTime ? Math.floor((Date.now() - lastFeeTime) / 1000) : 0;
+      const lastStr = lastFee > 0 ? `+${lastFee.toFixed(6)}` : '---';
+      const agoStr = lastFeeTime ? `${ago}s ago` : '';
+      const time = new Date().toISOString().slice(11, 19);
+
+      const line = `[${time}] ${args.symbol} | Total: ${(Number(total) / 1e9).toFixed(6)} SOL | Last: ${lastStr} ${agoStr} | #${entryCount}`;
+      process.stdout.write(`\r${line.padEnd(90)}`);
+    }, 500);
+  } else {
+    if (tokenInfo) {
+      console.log(`\n📋 TOKEN INFO`);
+      console.log('─'.repeat(40));
+      console.log(`Mint:        ${tokenInfo.mint.toBase58()}`);
+      console.log(`BC:          ${tokenInfo.bondingCurve.toBase58()}`);
+      console.log(`Creator:     ${tokenInfo.creator.toBase58()}`);
+      console.log(`BC Vault:    ${tokenInfo.creatorVaultBC.toBase58()}`);
+      console.log(`AMM Vault:   ${tokenInfo.creatorVaultAMM.toBase58()}`);
+      console.log(`Pool:        ${tokenInfo.pool.toBase58()}`);
+      console.log(`Migrated:    ${tokenInfo.migrated ? 'Yes (AMM)' : 'No (Bonding Curve)'}`);
+      console.log('─'.repeat(40));
+    }
+
+    console.log('\n✅ Daemon running. Press Ctrl+C to stop.\n');
+  }
 }
 
 main().catch((error) => {
