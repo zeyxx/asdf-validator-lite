@@ -3,39 +3,29 @@
  *
  * Track creator fees for a SINGLE Pump.fun token.
  *
- * Key difference from asdf-validator:
- * - Monitors a specific bonding curve account
- * - Deserializes BC data to track exact creator fees
- * - Also monitors AMM pool fees after migration
+ * Key features:
+ * - Transaction-based tracking (not balance polling)
+ * - Monitors BC vault (native SOL) and AMM vault (WSOL token account)
+ * - Proof-of-History with transaction signatures
+ * - Handles PumpXIsBack referral fees
  */
 
-import { Connection, PublicKey } from '@solana/web3.js';
+import { Connection, PublicKey, ConfirmedSignatureInfo } from '@solana/web3.js';
+import { getAssociatedTokenAddress, getAccount } from '@solana/spl-token';
 import { createHash } from 'crypto';
 import * as fs from 'fs';
 
 // ============================================================================
-// Program IDs
+// Program IDs & Constants
 // ============================================================================
 
 const PUMP_FUN_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
-const PUMP_SWAP_PROGRAM = new PublicKey('PSwapMdSai8tjrEXcxFeQth87xC4rRsa4VA5mhGhXkP');
+const PUMP_AMM_PROGRAM = new PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA');
+const WSOL_MINT = new PublicKey('So11111111111111111111111111111111111111112');
 
 // ============================================================================
 // Bonding Curve Account Structure
 // ============================================================================
-
-/**
- * Pump.fun Bonding Curve Account Layout:
- *
- * discriminator:         8 bytes (anchor discriminator)
- * virtual_token_reserves: u64 (8 bytes)
- * virtual_sol_reserves:   u64 (8 bytes)
- * real_token_reserves:    u64 (8 bytes)
- * real_sol_reserves:      u64 (8 bytes)
- * token_total_supply:     u64 (8 bytes)
- * complete:               bool (1 byte)
- * creator:                Pubkey (32 bytes)
- */
 
 interface BondingCurveData {
   virtualTokenReserves: bigint;
@@ -48,12 +38,10 @@ interface BondingCurveData {
 }
 
 function deserializeBondingCurve(data: Buffer): BondingCurveData | null {
-  // Structure: 8 (discriminator) + 40 (5 u64s) + 1 (bool) + 32 (pubkey) = 81 bytes minimum
   if (data.length < 81) return null;
 
   try {
-    // Skip 8-byte discriminator
-    let offset = 8;
+    let offset = 8; // Skip discriminator
 
     const virtualTokenReserves = data.readBigUInt64LE(offset); offset += 8;
     const virtualSolReserves = data.readBigUInt64LE(offset); offset += 8;
@@ -97,12 +85,27 @@ export function deriveCreatorVault(creator: PublicKey): PublicKey {
   return pda;
 }
 
+export function deriveAMMPool(mint: PublicKey, index: number = 0): PublicKey {
+  const indexBuffer = Buffer.alloc(2);
+  indexBuffer.writeUInt16LE(index);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('pool'), mint.toBuffer(), WSOL_MINT.toBuffer(), indexBuffer],
+    PUMP_AMM_PROGRAM
+  );
+  return pda;
+}
+
 export function deriveAMMCreatorVault(creator: PublicKey): PublicKey {
   const [pda] = PublicKey.findProgramAddressSync(
     [Buffer.from('creator_vault'), creator.toBuffer()],
-    PUMP_SWAP_PROGRAM
+    PUMP_AMM_PROGRAM
   );
   return pda;
+}
+
+export async function deriveAMMCreatorVaultATA(creator: PublicKey): Promise<PublicKey> {
+  const creatorVault = deriveAMMCreatorVault(creator);
+  return getAssociatedTokenAddress(WSOL_MINT, creatorVault, true);
 }
 
 // ============================================================================
@@ -112,7 +115,6 @@ export function deriveAMMCreatorVault(creator: PublicKey): PublicKey {
 export const GENESIS_HASH = 'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456';
 
 export type HistoryEventType = 'FEE' | 'CLAIM' | 'MIGRATE';
-
 export type VaultType = 'BC' | 'AMM';
 
 export interface HistoryEntry {
@@ -128,6 +130,7 @@ export interface HistoryEntry {
   timestamp: number;
   date: string;
   hash: string;
+  txSignature: string;
 }
 
 export interface HistoryLog {
@@ -138,6 +141,7 @@ export interface HistoryLog {
   creator: string;
   creatorVaultBC: string;
   creatorVaultAMM: string;
+  pool: string;
   migrated: boolean;
   startedAt: string;
   lastUpdated: string;
@@ -159,6 +163,7 @@ export function computeEntryHash(entry: Omit<HistoryEntry, 'hash'>): string {
     entry.balanceAfter,
     entry.slot.toString(),
     entry.timestamp.toString(),
+    entry.txSignature,
   ].join('|');
 
   return createHash('sha256').update(data).digest('hex');
@@ -180,33 +185,18 @@ export function verifyHistoryChain(log: HistoryLog): VerifyResult {
   for (let i = 0; i < log.entries.length; i++) {
     const entry = log.entries[i];
 
-    // Check sequence
     if (entry.sequence !== i + 1) {
-      return {
-        valid: false,
-        entryIndex: i,
-        error: `Expected sequence ${i + 1}, got ${entry.sequence}`,
-      };
+      return { valid: false, entryIndex: i, error: `Expected sequence ${i + 1}, got ${entry.sequence}` };
     }
 
-    // Check prevHash linkage
     if (entry.prevHash !== expectedPrevHash) {
-      return {
-        valid: false,
-        entryIndex: i,
-        error: `prevHash mismatch`,
-      };
+      return { valid: false, entryIndex: i, error: `prevHash mismatch` };
     }
 
-    // Recompute and verify hash
     const { hash, ...entryWithoutHash } = entry;
     const computedHash = computeEntryHash(entryWithoutHash);
     if (computedHash !== hash) {
-      return {
-        valid: false,
-        entryIndex: i,
-        error: `Hash mismatch`,
-      };
+      return { valid: false, entryIndex: i, error: `Hash mismatch` };
     }
 
     expectedPrevHash = hash;
@@ -221,7 +211,7 @@ export function loadHistoryLog(filePath: string): HistoryLog {
 }
 
 // ============================================================================
-// Daemon Configuration
+// Token Info
 // ============================================================================
 
 export interface TokenInfo {
@@ -230,9 +220,14 @@ export interface TokenInfo {
   bondingCurve: PublicKey;
   creator: PublicKey;
   creatorVaultBC: PublicKey;
-  creatorVaultAMM: PublicKey;
+  creatorVaultAMM: PublicKey; // WSOL ATA
+  pool: PublicKey;
   migrated: boolean;
 }
+
+// ============================================================================
+// Daemon Configuration
+// ============================================================================
 
 export interface DaemonConfig {
   rpcUrl: string;
@@ -263,9 +258,10 @@ export class ValidatorLiteDaemon {
   // Token info
   private tokenInfo: TokenInfo | null = null;
 
-  // Balance tracking
-  private lastBCBalance: bigint = 0n;
-  private lastAMMBalance: bigint = 0n;
+  // Transaction tracking
+  private lastBCSignature: string | null = null;
+  private lastAMMSignature: string | null = null;
+  private processedTxs: Set<string> = new Set();
 
   // Fee totals
   private bcFees: bigint = 0n;
@@ -276,7 +272,7 @@ export class ValidatorLiteDaemon {
 
   constructor(config: DaemonConfig) {
     this.config = {
-      pollInterval: 5000,
+      pollInterval: 2000,
       statsInterval: 60000,
       ...config,
     };
@@ -308,14 +304,12 @@ export class ValidatorLiteDaemon {
     this.log(`Creator: ${this.tokenInfo.creator.toBase58()}`);
     this.log(`Creator Vault (BC): ${this.tokenInfo.creatorVaultBC.toBase58()}`);
     this.log(`Creator Vault (AMM): ${this.tokenInfo.creatorVaultAMM.toBase58()}`);
+    this.log(`Pool: ${this.tokenInfo.pool.toBase58()}`);
     this.log(`Migrated: ${this.tokenInfo.migrated}`);
-
-    // Initialize balances
-    await this.initializeBalances();
 
     // Initialize history if enabled
     if (this.config.historyFile) {
-      this.initializeHistory();
+      await this.initializeHistory();
     }
 
     this.running = true;
@@ -348,7 +342,6 @@ export class ValidatorLiteDaemon {
       this.statsTimer = null;
     }
 
-    // Save history
     if (this.historyLog && this.config.historyFile) {
       this.saveHistory();
     }
@@ -359,12 +352,10 @@ export class ValidatorLiteDaemon {
   private async initializeToken(): Promise<void> {
     const mint = new PublicKey(this.config.mint);
 
-    // Derive or use provided bonding curve
     const bondingCurve = this.config.bondingCurve
       ? new PublicKey(this.config.bondingCurve)
       : deriveBondingCurve(mint);
 
-    // Fetch bonding curve account to get creator
     const bcAccountInfo = await this.connection.getAccountInfo(bondingCurve);
 
     if (!bcAccountInfo) {
@@ -379,7 +370,8 @@ export class ValidatorLiteDaemon {
 
     const creator = bcData.creator;
     const creatorVaultBC = deriveCreatorVault(creator);
-    const creatorVaultAMM = deriveAMMCreatorVault(creator);
+    const creatorVaultAMM = await deriveAMMCreatorVaultATA(creator);
+    const pool = deriveAMMPool(mint, 0);
 
     this.tokenInfo = {
       mint,
@@ -388,33 +380,12 @@ export class ValidatorLiteDaemon {
       creator,
       creatorVaultBC,
       creatorVaultAMM,
+      pool,
       migrated: bcData.complete,
     };
   }
 
-  private async initializeBalances(): Promise<void> {
-    if (!this.tokenInfo) return;
-
-    // Get BC vault balance
-    try {
-      const bcBalance = await this.connection.getBalance(this.tokenInfo.creatorVaultBC);
-      this.lastBCBalance = BigInt(bcBalance);
-      this.log(`BC vault initial: ${Number(this.lastBCBalance) / 1e9} SOL`);
-    } catch {
-      this.lastBCBalance = 0n;
-    }
-
-    // Get AMM vault balance
-    try {
-      const ammBalance = await this.connection.getBalance(this.tokenInfo.creatorVaultAMM);
-      this.lastAMMBalance = BigInt(ammBalance);
-      this.log(`AMM vault initial: ${Number(this.lastAMMBalance) / 1e9} SOL`);
-    } catch {
-      this.lastAMMBalance = 0n;
-    }
-  }
-
-  private initializeHistory(): void {
+  private async initializeHistory(): Promise<void> {
     if (!this.tokenInfo) return;
 
     // Try to load existing history
@@ -423,8 +394,18 @@ export class ValidatorLiteDaemon {
         this.historyLog = loadHistoryLog(this.config.historyFile);
         this.log(`Loaded existing history with ${this.historyLog.entryCount} entries`);
 
-        // Restore totals
-        this.bcFees = BigInt(this.historyLog.totalFees);
+        // Restore totals and processed txs
+        for (const entry of this.historyLog.entries) {
+          this.processedTxs.add(entry.txSignature);
+          const amount = BigInt(entry.amount);
+          if (entry.eventType === 'FEE' && amount > 0n) {
+            if (entry.vaultType === 'BC') {
+              this.bcFees += amount;
+            } else {
+              this.ammFees += amount;
+            }
+          }
+        }
 
         return;
       } catch (error) {
@@ -441,6 +422,7 @@ export class ValidatorLiteDaemon {
       creator: this.tokenInfo.creator.toBase58(),
       creatorVaultBC: this.tokenInfo.creatorVaultBC.toBase58(),
       creatorVaultAMM: this.tokenInfo.creatorVaultAMM.toBase58(),
+      pool: this.tokenInfo.pool.toBase58(),
       migrated: this.tokenInfo.migrated,
       startedAt: new Date().toISOString(),
       lastUpdated: new Date().toISOString(),
@@ -476,11 +458,13 @@ export class ValidatorLiteDaemon {
         await this.checkMigration();
       }
 
-      // Poll BC vault
-      await this.pollVault('BC', this.tokenInfo.creatorVaultBC);
+      // Poll BC vault transactions
+      await this.pollVaultTransactions('BC', this.tokenInfo.creatorVaultBC);
 
-      // Poll AMM vault (if migrated or always check)
-      await this.pollVault('AMM', this.tokenInfo.creatorVaultAMM);
+      // Poll AMM vault transactions (WSOL token account)
+      if (this.tokenInfo.migrated) {
+        await this.pollAMMVaultTransactions();
+      }
 
     } catch (error) {
       this.log(`Poll error: ${error}`);
@@ -515,81 +499,255 @@ export class ValidatorLiteDaemon {
     }
   }
 
-  private async pollVault(vaultType: VaultType, vault: PublicKey): Promise<void> {
+  private async pollVaultTransactions(vaultType: VaultType, vault: PublicKey): Promise<void> {
     try {
-      const slotInfo = await this.connection.getSlot();
-      const balance = await this.connection.getBalance(vault);
-      const currentBalance = BigInt(balance);
-      const timestamp = Date.now();
+      // Get recent signatures (most recent first)
+      const signatures = await this.connection.getSignaturesForAddress(vault, {
+        limit: 50,
+      });
 
-      const lastBalance = vaultType === 'BC' ? this.lastBCBalance : this.lastAMMBalance;
-      const delta = currentBalance - lastBalance;
+      if (signatures.length === 0) return;
 
-      if (delta !== 0n) {
-        const eventType: HistoryEventType = delta > 0n ? 'FEE' : 'CLAIM';
+      // On first poll, just record the latest signature (skip historical)
+      if (!this.lastBCSignature) {
+        this.lastBCSignature = signatures[0].signature;
+        this.log(`BC: Initialized at signature ${signatures[0].signature.slice(0, 8)}...`);
+        return;
+      }
 
-        this.handleBalanceChange(eventType, vaultType, vault, delta, lastBalance, currentBalance, slotInfo, timestamp);
-
-        if (vaultType === 'BC') {
-          this.lastBCBalance = currentBalance;
-        } else {
-          this.lastAMMBalance = currentBalance;
+      // Find new transactions (those newer than lastSignature)
+      const newSigs: typeof signatures = [];
+      for (const sig of signatures) {
+        if (sig.signature === this.lastBCSignature) break;
+        if (!this.processedTxs.has(sig.signature)) {
+          newSigs.push(sig);
         }
       }
+
+      if (newSigs.length === 0) return;
+
+      // Process in chronological order (oldest first)
+      for (const sig of newSigs.reverse()) {
+        await this.processTransaction(vaultType, vault, sig);
+        this.processedTxs.add(sig.signature);
+      }
+
+      // Update last signature
+      this.lastBCSignature = signatures[0].signature;
+
     } catch (error) {
-      this.log(`Error polling ${vaultType} vault: ${error}`);
+      this.log(`Error polling ${vaultType} transactions: ${error}`);
     }
   }
 
-  private handleBalanceChange(
-    eventType: HistoryEventType,
+  private async pollAMMVaultTransactions(): Promise<void> {
+    if (!this.tokenInfo) return;
+
+    const vault = this.tokenInfo.creatorVaultAMM;
+
+    try {
+      // Get recent signatures (most recent first)
+      const signatures = await this.connection.getSignaturesForAddress(vault, {
+        limit: 50,
+      });
+
+      if (signatures.length === 0) return;
+
+      // On first poll, just record the latest signature (skip historical)
+      if (!this.lastAMMSignature) {
+        this.lastAMMSignature = signatures[0].signature;
+        this.log(`AMM: Initialized at signature ${signatures[0].signature.slice(0, 8)}...`);
+        return;
+      }
+
+      // Find new transactions (those newer than lastSignature)
+      const newSigs: typeof signatures = [];
+      for (const sig of signatures) {
+        if (sig.signature === this.lastAMMSignature) break;
+        if (!this.processedTxs.has(sig.signature)) {
+          newSigs.push(sig);
+        }
+      }
+
+      if (newSigs.length === 0) return;
+
+      // Process in chronological order (oldest first)
+      for (const sig of newSigs.reverse()) {
+        await this.processAMMTransaction(vault, sig);
+        this.processedTxs.add(sig.signature);
+      }
+
+      // Update last signature
+      this.lastAMMSignature = signatures[0].signature;
+
+    } catch (error) {
+      this.log(`Error polling AMM transactions: ${error}`);
+    }
+  }
+
+  private async processTransaction(
     vaultType: VaultType,
     vault: PublicKey,
-    delta: bigint,
-    balanceBefore: bigint,
-    balanceAfter: bigint,
-    slot: number,
-    timestamp: number
-  ): void {
-    const absDelta = delta < 0n ? -delta : delta;
+    sigInfo: ConfirmedSignatureInfo
+  ): Promise<void> {
+    if (!this.tokenInfo) return;
 
-    if (eventType === 'FEE') {
-      if (vaultType === 'BC') {
-        this.bcFees += absDelta;
-      } else {
-        this.ammFees += absDelta;
+    try {
+      const tx = await this.connection.getTransaction(sigInfo.signature, {
+        maxSupportedTransactionVersion: 0,
+      });
+
+      if (!tx || !tx.meta) return;
+
+      // Get account keys
+      const accountKeys = tx.transaction.message.staticAccountKeys.map(k => k.toBase58());
+      const loadedAddresses = tx.meta.loadedAddresses;
+      if (loadedAddresses) {
+        accountKeys.push(...loadedAddresses.writable.map(k => k.toBase58()));
+        accountKeys.push(...loadedAddresses.readonly.map(k => k.toBase58()));
       }
 
-      const sol = Number(absDelta) / 1e9;
-      this.log(`${vaultType}: +${sol} SOL`);
+      // Check if this transaction involves our token (mint or bonding curve present)
+      const involveOurToken = accountKeys.includes(this.tokenInfo.mint.toBase58()) ||
+                              accountKeys.includes(this.tokenInfo.bondingCurve.toBase58());
+
+      if (!involveOurToken) return;
+
+      // Find vault index and calculate delta
+      const vaultIndex = accountKeys.indexOf(vault.toBase58());
+      if (vaultIndex === -1) return;
+
+      const preBalance = BigInt(tx.meta.preBalances[vaultIndex] || 0);
+      const postBalance = BigInt(tx.meta.postBalances[vaultIndex] || 0);
+      const delta = postBalance - preBalance;
+
+      if (delta <= 0n) return; // Only track fees (positive delta)
+
+      const timestamp = (tx.blockTime || 0) * 1000;
+
+      this.bcFees += delta;
+
+      this.log(`${vaultType}: +${Number(delta) / 1e9} SOL (${sigInfo.signature.slice(0, 8)}...)`);
 
       if (this.config.onFeeDetected) {
-        this.config.onFeeDetected(absDelta, vaultType, balanceAfter);
+        this.config.onFeeDetected(delta, vaultType, postBalance);
       }
-    } else {
-      const sol = Number(absDelta) / 1e9;
-      this.log(`${vaultType}: CLAIM -${sol} SOL`);
+
+      // Add to history
+      if (this.historyLog) {
+        const entry = this.createHistoryEntry(
+          'FEE',
+          vaultType,
+          vault.toBase58(),
+          delta.toString(),
+          preBalance.toString(),
+          postBalance.toString(),
+          tx.slot,
+          timestamp,
+          sigInfo.signature
+        );
+
+        this.historyLog.entries.push(entry);
+        this.saveHistory();
+
+        if (this.config.onHistoryEntry) {
+          this.config.onHistoryEntry(entry);
+        }
+      }
+
+    } catch (error) {
+      this.log(`Error processing tx ${sigInfo.signature}: ${error}`);
     }
+  }
 
-    // Add to history
-    if (this.historyLog) {
-      const entry = this.createHistoryEntry(
-        eventType,
-        vaultType,
-        vault.toBase58(),
-        delta.toString(),
-        balanceBefore.toString(),
-        balanceAfter.toString(),
-        slot,
-        timestamp
-      );
+  private async processAMMTransaction(
+    vault: PublicKey,
+    sigInfo: ConfirmedSignatureInfo
+  ): Promise<void> {
+    if (!this.tokenInfo) return;
 
-      this.historyLog.entries.push(entry);
-      this.saveHistory();
+    try {
+      const tx = await this.connection.getTransaction(sigInfo.signature, {
+        maxSupportedTransactionVersion: 0,
+      });
 
-      if (this.config.onHistoryEntry) {
-        this.config.onHistoryEntry(entry);
+      if (!tx || !tx.meta) return;
+
+      // Get account keys
+      const accountKeys = tx.transaction.message.staticAccountKeys.map(k => k.toBase58());
+      const loadedAddresses = tx.meta.loadedAddresses;
+      if (loadedAddresses) {
+        accountKeys.push(...loadedAddresses.writable.map(k => k.toBase58()));
+        accountKeys.push(...loadedAddresses.readonly.map(k => k.toBase58()));
       }
+
+      // Check if this transaction involves our token (mint or pool present)
+      const involveOurToken = accountKeys.includes(this.tokenInfo.mint.toBase58()) ||
+                              accountKeys.includes(this.tokenInfo.pool.toBase58());
+
+      if (!involveOurToken) return;
+
+      // Find vault in token balances (WSOL)
+      const vaultAddress = vault.toBase58();
+      const preTokenBalances = tx.meta.preTokenBalances || [];
+      const postTokenBalances = tx.meta.postTokenBalances || [];
+
+      // Find the token balance entry for our vault
+      let preBalance = 0n;
+      let postBalance = 0n;
+
+      for (const bal of preTokenBalances) {
+        if (accountKeys[bal.accountIndex] === vaultAddress) {
+          preBalance = BigInt(bal.uiTokenAmount.amount);
+          break;
+        }
+      }
+
+      for (const bal of postTokenBalances) {
+        if (accountKeys[bal.accountIndex] === vaultAddress) {
+          postBalance = BigInt(bal.uiTokenAmount.amount);
+          break;
+        }
+      }
+
+      const delta = postBalance - preBalance;
+
+      if (delta <= 0n) return; // Only track fees (positive delta)
+
+      const timestamp = (tx.blockTime || 0) * 1000;
+
+      this.ammFees += delta;
+
+      this.log(`AMM: +${Number(delta) / 1e9} SOL (${sigInfo.signature.slice(0, 8)}...)`);
+
+      if (this.config.onFeeDetected) {
+        this.config.onFeeDetected(delta, 'AMM', postBalance);
+      }
+
+      // Add to history
+      if (this.historyLog) {
+        const entry = this.createHistoryEntry(
+          'FEE',
+          'AMM',
+          vaultAddress,
+          delta.toString(),
+          preBalance.toString(),
+          postBalance.toString(),
+          tx.slot,
+          timestamp,
+          sigInfo.signature
+        );
+
+        this.historyLog.entries.push(entry);
+        this.saveHistory();
+
+        if (this.config.onHistoryEntry) {
+          this.config.onHistoryEntry(entry);
+        }
+      }
+
+    } catch (error) {
+      this.log(`Error processing AMM tx ${sigInfo.signature}: ${error}`);
     }
   }
 
@@ -601,7 +759,8 @@ export class ValidatorLiteDaemon {
     balanceBefore: string,
     balanceAfter: string,
     slot: number,
-    timestamp: number
+    timestamp: number,
+    txSignature: string
   ): HistoryEntry {
     const prevHash = this.historyLog!.entries.length > 0
       ? this.historyLog!.entries[this.historyLog!.entries.length - 1].hash
@@ -621,6 +780,7 @@ export class ValidatorLiteDaemon {
       slot,
       timestamp,
       date: new Date(timestamp).toISOString(),
+      txSignature,
     };
 
     const hash = computeEntryHash(entryWithoutHash);
@@ -654,5 +814,4 @@ export class ValidatorLiteDaemon {
   }
 }
 
-// Export everything
 export default ValidatorLiteDaemon;

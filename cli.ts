@@ -34,15 +34,26 @@ interface CLIArgs {
   verifyFile: string | null;
 }
 
+function getRpcUrl(): string {
+  // Priority: RPC_URL env > HELIUS_API_KEY env > public RPC
+  if (process.env.RPC_URL) {
+    return process.env.RPC_URL;
+  }
+  if (process.env.HELIUS_API_KEY) {
+    return `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`;
+  }
+  return 'https://api.mainnet-beta.solana.com';
+}
+
 function parseArgs(args: string[]): CLIArgs {
   const result: CLIArgs = {
     mint: null,
     symbol: 'TOKEN',
     bondingCurve: null,
-    rpcUrl: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
+    rpcUrl: getRpcUrl(),
     verbose: false,
     showHelp: false,
-    pollInterval: 5000,
+    pollInterval: 2000,
     historyFile: null,
     verifyFile: null,
   };
@@ -108,7 +119,8 @@ OPTIONS:
   --help, -h                 Show this help
 
 ENVIRONMENT:
-  RPC_URL                    Default RPC URL
+  HELIUS_API_KEY             Helius API key (recommended)
+  RPC_URL                    Custom RPC URL (overrides HELIUS_API_KEY)
 
 EXAMPLES:
   # Track fees for a specific token
@@ -345,6 +357,7 @@ async function main(): Promise<void> {
     console.log(`Creator:     ${tokenInfo.creator.toBase58()}`);
     console.log(`BC Vault:    ${tokenInfo.creatorVaultBC.toBase58()}`);
     console.log(`AMM Vault:   ${tokenInfo.creatorVaultAMM.toBase58()}`);
+    console.log(`Pool:        ${tokenInfo.pool.toBase58()}`);
     console.log(`Migrated:    ${tokenInfo.migrated ? 'Yes (AMM)' : 'No (Bonding Curve)'}`);
     console.log('─'.repeat(40));
   }
