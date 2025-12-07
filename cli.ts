@@ -246,11 +246,16 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Mask API key in RPC URL for display
+  const displayRpc = args.rpcUrl.includes('api-key=')
+    ? args.rpcUrl.replace(/api-key=[^&]+/, 'api-key=****')
+    : args.rpcUrl.length > 50 ? args.rpcUrl.slice(0, 50) + '...' : args.rpcUrl;
+
   console.log('\n🎯 ASDF VALIDATOR LITE');
   console.log('═'.repeat(55));
   console.log(`Mint:       ${mint.toBase58()}`);
   console.log(`Symbol:     ${args.symbol}`);
-  console.log(`RPC:        ${args.rpcUrl.slice(0, 50)}...`);
+  console.log(`RPC:        ${displayRpc}`);
   console.log(`Poll:       ${args.pollInterval / 1000}s`);
   if (args.historyFile) {
     console.log(`PoH:        ${args.historyFile} ✓`);
